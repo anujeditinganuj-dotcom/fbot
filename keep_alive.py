@@ -3,9 +3,7 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
 from urllib.error import URLError
-from urllib.parse import urlparse, parse_qs, quote
 from urllib.request import Request, urlopen
 
 log = logging.getLogger(__name__)
@@ -15,125 +13,253 @@ _SERVER: HTTPServer | None = None
 _PING_THREAD: threading.Thread | None = None
 _LOCK = threading.Lock()
 
-PLAYER_PAGE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>Faphouse Player</title>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
-<style>
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  html, body {{ background:#0a0a0a; height:100%; width:100%; overflow:hidden; font-family:sans-serif; }}
-  .wrap {{ width:100vw; height:100vh; display:flex; align-items:center; justify-content:center; }}
-  video {{ width:100%; height:100%; max-width:1000px; max-height:100vh; background:#000; }}
-  .msg {{ color:#f5c518; font-size:0.9rem; text-align:center; padding:1rem; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <video id="player" controls autoplay playsinline></video>
-</div>
-<script>
-  var src = {src_json};
-  var video = document.getElementById('player');
-  if (!src) {{
-    document.querySelector('.wrap').innerHTML = '<div class="msg">⚠️ Could not resolve this video.</div>';
-  }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
-    video.src = src;  // Safari/iOS: native HLS support
-  }} else if (window.Hls && Hls.isSupported()) {{
-    var hls = new Hls();
-    hls.loadSource(src);
-    hls.attachMedia(video);
-  }} else {{
-    document.querySelector('.wrap').innerHTML = '<div class="msg">⚠️ Your browser can\\'t play HLS streams.</div>';
-  }}
-</script>
-</body>
-</html>"""
+
+import urllib.parse
+import threading as _threading
+
+# ── Stream-proxy registry ────────────────────────────────────────────────────
+# Maps short code -> {"url": cdn_url, "name": filename, "size": int, "ts": float}
+# Populated by register_stream_proxy() called from main.py before sending the
+# stream link to the user. Entries expire after STREAM_PROXY_TTL seconds.
+_stream_registry: dict = {}
+_stream_registry_lock = _threading.Lock()
+STREAM_PROXY_TTL = 3600  # 1 hour — Flezen CDN signed URLs are valid ~1h
+
+_MIME_MAP = {
+    "mp4": "video/mp4", "mkv": "video/x-matroska", "webm": "video/webm",
+    "mov": "video/quicktime", "avi": "video/x-msvideo", "m4v": "video/x-m4v",
+    "ts":  "video/mp2t",     "flv": "video/x-flv",     "m2ts": "video/mp2t",
+    "mp3": "audio/mpeg",     "m4a": "audio/mp4",        "aac": "audio/aac",
+    "ogg": "audio/ogg",      "flac": "audio/flac",      "wav": "audio/wav",
+}
 
 
-def _resolve_stream_url(video_url: str) -> str | None:
-    """Tries every backend that can produce a real, directly-playable URL
-    (not just faphouse) — same domain-based ordering as main.py's
-    _downloader_for(), minus porn_fetch_downloader's sites, which don't
-    expose a resolvable URL separately from their own download() call."""
+def register_stream_proxy(code: str, cdn_url: str, filename: str, size: int = 0):
+    """Register a CDN URL under a short code so /stream/<code> can proxy it.
+    Call this from main.py right before building the stream button URL."""
+    entry = {"url": cdn_url, "name": filename, "size": size, "ts": time.time()}
+    with _stream_registry_lock:
+        _stream_registry[code] = entry
+        # Purge expired entries while we're here
+        now = time.time()
+        expired = [k for k, v in _stream_registry.items() if now - v["ts"] > STREAM_PROXY_TTL]
+        for k in expired:
+            del _stream_registry[k]
+    log.info("Registered stream proxy: /stream/%s -> %s…", code, cdn_url[:80])
+
+
+def get_stream_public_url(code: str) -> str:
+    """Return the public /stream/<code> URL — fully auto-detected.
+    No env vars need to be set manually. Priority order:
+
+    1. RENDER_EXTERNAL_HOSTNAME  — auto-set by Render
+    2. RAILWAY_STATIC_URL        — auto-set by Railway
+    3. KOYEB_PUBLIC_DOMAIN       — auto-set by Koyeb
+    4. FLY_APP_NAME              — auto-set by Fly.io
+    5. HTTP request to ipify.org — detects VPS public IP automatically
+    6. Fallback: localhost
+    """
+    # ── Render ──────────────────────────────────────────────────────
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip().strip("/")
+    if host:
+        return f"https://{host}/stream/{code}"
+
+    # ── Railway ─────────────────────────────────────────────────────
+    railway = os.environ.get("RAILWAY_STATIC_URL", "").strip().rstrip("/")
+    if railway:
+        return f"https://{railway}/stream/{code}"
+
+    # ── Koyeb ───────────────────────────────────────────────────────
+    koyeb = os.environ.get("KOYEB_PUBLIC_DOMAIN", "").strip().strip("/")
+    if koyeb:
+        return f"https://{koyeb}/stream/{code}"
+
+    # ── Fly.io ──────────────────────────────────────────────────────
+    fly_app = os.environ.get("FLY_APP_NAME", "").strip()
+    if fly_app:
+        return f"https://{fly_app}.fly.dev/stream/{code}"
+
+    # ── VPS — auto-detect public IP via ipify ───────────────────────
+    # Cache the result so we don't hit ipify on every stream link
+    public_ip = _get_cached_public_ip()
+    if public_ip:
+        return f"http://{public_ip}:{_PORT}/stream/{code}"
+
+    # ── Fallback ────────────────────────────────────────────────────
+    return f"http://127.0.0.1:{_PORT}/stream/{code}"
+
+
+_cached_public_ip: str | None = None
+_cached_public_ip_ts: float = 0
+_IP_CACHE_TTL = 3600  # re-fetch every hour
+
+
+def _get_cached_public_ip() -> str | None:
+    """Fetch and cache the server's public IP via ipify.org."""
+    global _cached_public_ip, _cached_public_ip_ts
+    now = time.time()
+    if _cached_public_ip and (now - _cached_public_ip_ts) < _IP_CACHE_TTL:
+        return _cached_public_ip
     try:
-        import fpo_downloader
-        if fpo_downloader.is_fpo_link(video_url):
-            variants = fpo_downloader.get_available_qualities(video_url)
-            return variants[0]["url"] if variants else None
-    except Exception as exc:
-        log.warning("fpo player resolve failed for %s: %s", video_url, exc)
-
-    try:
-        import ytdlp_downloader
-        if ytdlp_downloader.is_supported_link(video_url):
-            return ytdlp_downloader.get_stream_url(video_url)
-    except Exception as exc:
-        log.warning("ytdlp player resolve failed for %s: %s", video_url, exc)
-
-    try:
-        import faphouse_downloader
-        return faphouse_downloader.client.get_m3u8_url(video_url)
-    except Exception as exc:
-        log.warning("faphouse player resolve failed for %s: %s", video_url, exc)
-        return None
-
-
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/play":
-            self._handle_play(parsed)
-            return
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Anujkumar alive")
-
-    def _handle_play(self, parsed):
-        """Resolves a faphouse video page link to its m3u8 stream and serves
-        a minimal hls.js player page for it — this is what the bot's
-        "Stream Link" button points at instead of handing out a bare .m3u8
-        URL, which most phone browsers can't do anything useful with on
-        their own."""
-        video_url = (parse_qs(parsed.query).get("url") or [None])[0]
-        stream_url = None
-        if video_url:
+        import urllib.request as _ur
+        # Try multiple IP detection services in order
+        for api_url in [
+            "https://api.ipify.org",
+            "https://api4.my-ip.io/ip",
+            "https://checkip.amazonaws.com",
+        ]:
             try:
-                stream_url = _resolve_stream_url(video_url)
-            except Exception as exc:
-                log.warning("Player resolve failed for %s: %s", video_url, exc)
+                req = _ur.Request(api_url, headers={"User-Agent": "curl/7.0"})
+                with _ur.urlopen(req, timeout=5) as resp:
+                    ip = resp.read().decode().strip()
+                    if ip and not ip.startswith("127.") and not ip.startswith("10."):
+                        _cached_public_ip = ip
+                        _cached_public_ip_ts = now
+                        log.info("Auto-detected public IP: %s", ip)
+                        return ip
+            except Exception:
+                continue
+    except Exception as e:
+        log.debug("Public IP detection failed: %s", e)
+    return None
 
-        import json
-        html = PLAYER_PAGE_HTML.format(src_json=json.dumps(stream_url))
-        body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+
+class _StreamingHandler(BaseHTTPRequestHandler):
+    """HTTP handler that:
+      • GET /health, HEAD /health → 200 keep-alive (unchanged)
+      • GET /stream/<code>        → reverse-proxy the registered CDN URL with
+                                    proper Content-Type, Content-Disposition
+                                    (inline), and Range pass-through so
+                                    browsers and VLC can seek inside the video.
+      • HEAD /stream/<code>       → same but no body (for duration probe)
+      Any other path             → 200 "alive" (backward-compat health check)
+    """
+
+    def log_message(self, *a):
+        pass  # suppress per-request noise in Render logs
+
+    def _send_error_response(self, code: int, msg: str):
+        body = msg.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def do_HEAD(self):
-        self.send_response(200)
+    def _handle_stream(self, is_head: bool):
+        # Parse /stream/<code>
+        path = urllib.parse.unquote(self.path.split("?")[0])
+        parts = path.strip("/").split("/")
+        if len(parts) < 2 or parts[0] != "stream":
+            # Not a stream path — fall through to health response
+            self.send_response(200)
+            self.end_headers()
+            if not is_head:
+                self.wfile.write(b"Anujkumar alive")
+            return
+
+        code = parts[1]
+        with _stream_registry_lock:
+            entry = _stream_registry.get(code)
+
+        if not entry:
+            self._send_error_response(404, "Stream not found or expired.")
+            return
+
+        cdn_url  = entry["url"]
+        filename = entry["name"]
+        size     = entry.get("size", 0)
+
+        # Determine Content-Type from extension
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        content_type = _MIME_MAP.get(ext, "video/mp4")
+
+        # Pass Range header through to the CDN so seeking works
+        range_header = self.headers.get("Range", "")
+        req_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://flezen.com/",
+        }
+        if range_header:
+            req_headers["Range"] = range_header
+
+        try:
+            import requests as _req
+            upstream = _req.get(
+                cdn_url, headers=req_headers, stream=True, timeout=(10, 300),
+                allow_redirects=True,
+            )
+        except Exception as e:
+            log.warning("Stream proxy fetch failed for %s: %s", code, e)
+            self._send_error_response(502, f"Upstream fetch failed: {e}")
+            return
+
+        # Mirror the upstream status code (206 Partial Content if Range was used)
+        self.send_response(upstream.status_code)
+        self.send_header("Content-Type", content_type)
+        # "inline" makes the browser play it instead of downloading
+        safe_name = filename.replace('"', "").replace("\\", "")
+        self.send_header(
+            "Content-Disposition",
+            f'inline; filename="{safe_name}"',
+        )
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-cache")
+
+        # Forward content-length and content-range from upstream
+        for hdr in ("Content-Length", "Content-Range"):
+            val = upstream.headers.get(hdr)
+            if val:
+                self.send_header(hdr, val)
+            elif hdr == "Content-Length" and size and not range_header:
+                self.send_header("Content-Length", str(size))
+
         self.end_headers()
 
-    def log_message(self, *a):
-        pass
+        if is_head:
+            upstream.close()
+            return
+
+        # Stream bytes to client in 256 KB chunks
+        try:
+            for chunk in upstream.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client disconnected mid-stream — normal
+        except Exception as e:
+            log.warning("Stream proxy write error for %s: %s", code, e)
+        finally:
+            upstream.close()
+
+    def do_GET(self):
+        if self.path.strip("/").startswith("stream/"):
+            self._handle_stream(is_head=False)
+        else:
+            try:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"Anujkumar alive")
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client disconnected — harmless
+
+    def do_HEAD(self):
+        if self.path.strip("/").startswith("stream/"):
+            self._handle_stream(is_head=True)
+        else:
+            try:
+                self.send_response(200)
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client disconnected — harmless
 
 
-class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    # A /play request resolves a video (a few seconds of network I/O) —
-    # without threading that would block the plain health-check GET/HEAD
-    # requests hosts use to decide the service is alive, which could look
-    # like a hung/unhealthy service and trigger an unwanted restart.
-    daemon_threads = True
-
-
-def get_public_url() -> str:
-    """The externally-reachable base URL for this process, used to build
-    the /play player link. Same detection order as _ping_target()."""
-    for env_name in ("PUBLIC_URL", "APP_URL", "PING_URL", "HEALTHCHECK_URL", "RENDER_EXTERNAL_URL"):
+def _ping_target() -> str:
+    for env_name in ("PING_URL", "HEALTHCHECK_URL", "RENDER_EXTERNAL_URL", "APP_URL"):
         value = os.environ.get(env_name, "").strip()
         if value:
             return value.rstrip("/")
@@ -142,23 +268,6 @@ def get_public_url() -> str:
     if render_host:
         return f"https://{render_host}"
 
-    return ""
-
-
-def player_url(video_url: str) -> str:
-    """Builds the /play link for a given faphouse video page URL. Returns
-    "" if no public URL is configured (caller should fall back to
-    something else, e.g. the raw m3u8 link, in that case)."""
-    base = get_public_url()
-    if not base:
-        return ""
-    return f"{base}/play?url={quote(video_url, safe='')}"
-
-
-def _ping_target() -> str:
-    configured = get_public_url()
-    if configured:
-        return configured
     return f"http://127.0.0.1:{_PORT}"
 
 
@@ -166,15 +275,36 @@ def _ping_loop():
     target = _ping_target()
     log.info("Keep-alive ping target: %s (every %ss)", target, _PING_INTERVAL)
 
+    # Wait for server to be fully ready before first ping
+    # (avoids 502 on Render where bot starts before web process is up)
+    time.sleep(30)
+
+    _consecutive_failures = 0
+
     while True:
         try:
             req = Request(target, method="HEAD")
             with urlopen(req, timeout=20) as resp:
-                log.info("Keep-alive ping ok: %s", getattr(resp, "status", 200))
+                status = getattr(resp, "status", 200)
+                if _consecutive_failures > 0:
+                    log.info("Keep-alive ping recovered after %d failure(s): %s", _consecutive_failures, status)
+                else:
+                    log.debug("Keep-alive ping ok: %s", status)
+                _consecutive_failures = 0
         except URLError as exc:
-            log.warning("Keep-alive ping failed: %s", exc)
+            _consecutive_failures += 1
+            reason = str(exc.reason) if hasattr(exc, "reason") else str(exc)
+            # 502 on startup is expected — only warn after 3 consecutive failures
+            if _consecutive_failures >= 3:
+                log.warning("Keep-alive ping failed (%dx): %s", _consecutive_failures, reason)
+            else:
+                log.debug("Keep-alive ping failed (attempt %d): %s", _consecutive_failures, reason)
         except Exception as exc:
-            log.warning("Keep-alive ping error: %s", exc)
+            _consecutive_failures += 1
+            if _consecutive_failures >= 3:
+                log.warning("Keep-alive ping error (%dx): %s", _consecutive_failures, exc)
+            else:
+                log.debug("Keep-alive ping error (attempt %d): %s", _consecutive_failures, exc)
 
         time.sleep(_PING_INTERVAL)
 
@@ -196,7 +326,8 @@ def Anujkumar_keep_alive(real_server_started: bool = False):
     with _LOCK:
         if not real_server_started and _SERVER is None:
             try:
-                _SERVER = _ThreadingHTTPServer(("0.0.0.0", _PORT), _HealthHandler)
+                from http.server import ThreadingHTTPServer
+                _SERVER = ThreadingHTTPServer(("0.0.0.0", _PORT), _StreamingHandler)
             except OSError as exc:
                 log.warning("Health server unavailable on :%s: %s", _PORT, exc)
                 # Fall through — still start the self-ping thread below even
