@@ -7,7 +7,7 @@
 # all — which is exactly why the Titanium "Auto-Create Bot" button would
 # sometimes just show "not available" for no obvious reason. Only
 # kurigram is needed; it's a drop-in pyrogram replacement.
-kurigram>=2.2.18
+kurigram>=2.2.26
 tgcrypto==1.2.5
 python-dotenv==1.0.0
 requests>=2.32.2,<3
