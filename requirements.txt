@@ -47,6 +47,15 @@ yt-dlp[default,curl-cffi]
 deno
 curl_cffi>=0.10,<0.14
 
+# PO-token support for YouTube (see pot_provider.py + ytdlp_downloader.py's
+# player_client logic) — this is the yt-dlp-side plugin that talks to the
+# local bgutil-ytdlp-pot-provider HTTP server pot_provider.py starts at
+# boot. Safe to have installed even if that server never comes up on this
+# host (e.g. missing native build tools for its "canvas" dependency) — the
+# plugin just won't find a provider to use and yt-dlp falls back exactly
+# as if this weren't installed at all.
+bgutil-ytdlp-pot-provider
+
 # porn_fetch_downloader.py backend — maintained per-site API packages
 # (same ones Porn_Fetch itself uses), installed straight from their repos
 eaf_base_api @ git+https://github.com/EchterAlsFake/eaf_base_api
