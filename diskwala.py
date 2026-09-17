@@ -179,8 +179,8 @@ class DiskwalaAuthError(Exception):
 
 API_DOWNLOAD = "https://api2.diskwala.net/api/diskwala/download"
 API_STATUS = "https://api2.diskwala.net/api/diskwala/status"
-VIDBUNKER_API_DOWNLOAD = "https://api2.diskwala.net/api/vidbunker/download"
-VIDBUNKER_API_STATUS = "https://api2.diskwala.net/api/vidbunker/status"
+VIDBUNKER_API_DOWNLOAD = "https://api2.diskwala.net/api/vidbunker.in/download"
+VIDBUNKER_API_STATUS = "https://api2.diskwala.net/api/vidbunker.in/status"
 ENCRYPTION_KEY = "e7109544dab612bd5b80b8a427ac474ba5541b9efff7a4ca1c8ef85df2489c23"
 
 
