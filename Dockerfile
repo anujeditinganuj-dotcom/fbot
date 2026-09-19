@@ -13,7 +13,24 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential gcc libffi-dev python3-dev ffmpeg git aria2 curl unzip \
     libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev \
+    chromium xvfb fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
+
+# FlareSolverr (Cloudflare JS-challenge bypass — see cf_bypass.py) runs in
+# this SAME container as its own background process, in its own isolated
+# venv (NOT pip-installed alongside this project's own requirements.txt —
+# FlareSolverr pins its own selenium/undetected-chromedriver versions,
+# and mixing those into this project's environment risks a real version
+# conflict with something else here needing a different pinned version
+# of a shared dependency). chromium+xvfb above are what it actually
+# drives; flaresolverr_bootstrap.py starts both it and Xvfb at bot
+# startup — see that file's docstring. Pinned to the v3.5.0 tag rather
+# than a branch so this build doesn't silently start pulling in
+# FlareSolverr's own future breaking changes.
+RUN git clone --branch v3.5.0 --depth 1 https://github.com/FlareSolverr/FlareSolverr.git /opt/flaresolverr \
+    && python3 -m venv /opt/flaresolverr/venv \
+    && /opt/flaresolverr/venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/flaresolverr/venv/bin/pip install --no-cache-dir -r /opt/flaresolverr/requirements.txt
 
 # YouTube now requires solving a JS challenge before yt-dlp can get a
 # playable URL — yt-dlp needs an external JS runtime to do that (Deno is
