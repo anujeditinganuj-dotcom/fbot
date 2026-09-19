@@ -457,8 +457,28 @@ def get_playlist_entries(url: str, limit: int = 50) -> list[dict]:
         if not e:
             continue
         video_id = e.get("id")
-        video_url = e.get("url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
-        if not video_url:
+        raw_url = e.get("url")
+        # BUG FIX: yt-dlp's flat-playlist mode gives YouTube entries a
+        # bare video ID in the "url" field (e.g. "BaW_jenozKc"), NOT a
+        # real URL — confirmed against yt-dlp's own test suite
+        # (test_youtube_flat_playlist_extraction asserts
+        # `entry['url'] == 'BaW_jenozKc'`, the raw id). The old
+        # `e.get("url") or (watch-url from video_id)` fallback never
+        # triggered because that bare id is a truthy string, so every
+        # entry in every YouTube playlist got the bare id as its "url" —
+        # not a link anything downstream could actually open/download.
+        # Always build the real watch URL from the id when we have one
+        # (reliable for YouTube); only trust raw_url as-is when it's
+        # already a full URL (other extractors' flat entries, or a
+        # future yt-dlp version that does return one), and treat it as a
+        # bare id itself as a last resort.
+        if video_id:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+        elif raw_url and raw_url.startswith("http"):
+            video_url = raw_url
+        elif raw_url:
+            video_url = f"https://www.youtube.com/watch?v={raw_url}"
+        else:
             continue
         entries.append({"url": video_url, "title": e.get("title")})
     return entries
@@ -616,21 +636,62 @@ def _save_info_cache():
 
 _load_info_cache()
 
+# ── Short-lived in-memory-only cache, YouTube specifically ─────────────────
+# YouTube's real per-format stream URLs/tokens go stale within minutes, so
+# these were never written to the disk cache above (or reused across a
+# later download) — that part's still correct. But get_available_qualities()
+# and get_page_meta() each call _extract_info() independently, and
+# show_quality_menu() (main.py) calls BOTH, back-to-back, for the same
+# link on every single request — with no cache at all that meant a full
+# extraction (up to 6 YouTube player clients) ran TWICE per request, which
+# is exactly what was making YouTube "bohot time mein fetch" (this is the
+# main fix for that; the tighter retries/timeout above help every site).
+# A short in-memory-only TTL fixes that double-fetch (the two calls are
+# seconds apart) without ever handing a stale token to an actual download
+# started minutes later.
+_YT_INFO_CACHE_TTL = 120
+_yt_info_cache: dict = {}
+_yt_info_cache_lock = _threading.Lock()
+
 
 def _extract_info(video_url: str) -> dict:
     _require_yt_dlp()
     video_url = _normalize_eporner_url(video_url)
 
-    # Check cache first (skip entire extract_info network round-trip)
+    # Check cache first (skip entire extract_info network round-trip).
+    # YouTube uses its own short-lived, disk-never in-memory cache (see
+    # _yt_info_cache above); every other site uses the longer disk cache.
     cache_key = video_url.split("?")[0].strip()
     now = time.time()
-    with _info_cache_lock:
-        entry = _info_cache.get(cache_key)
-    if entry and (now - entry.get("ts", 0)) < _INFO_CACHE_TTL:
-        logger.info(f"✅ yt-dlp info from cache (age: {int(now - entry['ts'])}s, instant).")
-        return entry["info"]
+    if _is_youtube(video_url):
+        with _yt_info_cache_lock:
+            yt_entry = _yt_info_cache.get(cache_key)
+        if yt_entry and (now - yt_entry.get("ts", 0)) < _YT_INFO_CACHE_TTL:
+            logger.info(f"✅ yt-dlp info from short-lived YouTube cache (age: {int(now - yt_entry['ts'])}s, instant).")
+            return yt_entry["info"]
+    else:
+        with _info_cache_lock:
+            entry = _info_cache.get(cache_key)
+        if entry and (now - entry.get("ts", 0)) < _INFO_CACHE_TTL:
+            logger.info(f"✅ yt-dlp info from cache (age: {int(now - entry['ts'])}s, instant).")
+            return entry["info"]
 
     opts = {**_base_opts(video_url), "skip_download": True}
+    # Metadata probe: fail fast. This single call can walk through up to
+    # 6 YouTube player clients (tv/web/ios/mweb/tv_embedded/android) or,
+    # on other sites, retry a slow/blocked CDN — and _base_opts()'s
+    # retries/timeouts (socket_timeout=30, retries=5, extractor_retries=3)
+    # are tuned for a DOWNLOAD already committed to one format, where
+    # patience matters more than speed. Applied here too, one slow/dead
+    # client can burn 30s * several retries before yt-dlp even tries the
+    # next client — exactly what was making the quality menu take minutes
+    # to show up ("YouTube ya bhi site par quality bohot time mein fetch
+    # hota hai"). Cut them for just this probe; download_video() below
+    # still gets the full patient settings from _base_opts() untouched.
+    opts["socket_timeout"] = 10
+    opts["retries"] = 2
+    opts["fragment_retries"] = 1
+    opts["extractor_retries"] = 1
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
@@ -655,8 +716,18 @@ def _extract_info(video_url: str) -> dict:
                 expected=True
             )
         raise
-    # Cache successful result (only non-YouTube — YT tokens expire fast)
-    if not _is_youtube(video_url):
+    # Cache successful result — disk cache (long TTL) for every other
+    # site; YouTube gets only the short in-memory cache from above (never
+    # written to disk, never reused for an actual download — see its
+    # docstring), just to cover this request's own back-to-back calls.
+    if _is_youtube(video_url):
+        with _yt_info_cache_lock:
+            _yt_info_cache[cache_key] = {"info": info, "ts": time.time()}
+            if len(_yt_info_cache) > 300:
+                oldest = sorted(_yt_info_cache, key=lambda k: _yt_info_cache[k].get("ts", 0))
+                for old_k in oldest[:50]:
+                    del _yt_info_cache[old_k]
+    else:
         with _info_cache_lock:
             _info_cache[cache_key] = {"info": info, "ts": time.time()}
             if len(_info_cache) > 300:
