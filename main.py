@@ -33,7 +33,7 @@ from config import (
 import faphouse_downloader as faphouse
 import fpo_downloader as fpo
 import porn_fetch_downloader as pf
-import ytdlp_downloaderrr as ytdlp
+import ytdlp_downloader as ytdlp
 import pot_provider
 import flaresolverr_bootstrap
 import ytsearch  # registers /search, /yts commands and plain-text auto-search
