@@ -5496,7 +5496,7 @@ if __name__ == "__main__":
     logger.info("Starting Faphouse Bot...")
     keep_alive()
     pot_provider.start_background()  # non-blocking — see pot_provider.py
-    flaresolverr_bootstrap.start_background()  # non-blocking — see flaresolverr_bootstrap.py
+    flaresolver_bootstrap.start_background()  # non-blocking — see flaresolverr_bootstrap.py
     auto_scraper.configure_caption_builder(build_caption, schedule_delete, build_stream_button_markup)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(ensure_indexes())
